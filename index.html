@@ -127,6 +127,23 @@
       <input type="checkbox" id="hiresToggle" checked />
     </label>
 
+    <label class="field row">
+      <span>
+        <span class="field-label">Deep verify (slower, more accurate)</span>
+        <span class="field-hint">Geocodes several candidates on the map, then runs a 2nd AI pass to pick the exact one. Uses 2 AI calls.</span>
+      </span>
+      <input type="checkbox" id="deepToggle" checked />
+    </label>
+
+    <div class="field-divider">Optional — reverse image search</div>
+    <label class="field">
+      <span class="field-label">Google Vision API key <span class="opt">(optional)</span></span>
+      <input type="password" id="visionKey" placeholder="AIza… (Cloud Vision key)" autocomplete="off" />
+      <span class="field-hint">Runs the photo through real reverse image search (landmark + web detection) for a big accuracy boost on recognizable places. Needs a
+        <a href="https://console.cloud.google.com/apis/library/vision.googleapis.com" target="_blank" rel="noopener">Cloud Vision key</a>
+        — separate from your AI Studio key. Leave blank to use the no-key multi-pass cross-check.</span>
+    </label>
+
     <div class="settings-actions">
       <button class="btn" id="saveSettings" type="button">Save</button>
     </div>

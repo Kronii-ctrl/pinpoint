@@ -16,6 +16,10 @@ const store = {
   set grounding(v) { localStorage.setItem("pp.grounding", v ? "on" : "off"); },
   get hires()      { return localStorage.getItem("pp.hires") !== "off"; },
   set hires(v)     { localStorage.setItem("pp.hires", v ? "on" : "off"); },
+  get visionKey()  { return localStorage.getItem("pp.visionkey") || ""; },
+  set visionKey(v) { localStorage.setItem("pp.visionkey", v); },
+  get deep()       { return localStorage.getItem("pp.deep") !== "off"; },
+  set deep(v)      { localStorage.setItem("pp.deep", v ? "on" : "off"); },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -24,6 +28,7 @@ const els = {
   settingsBtn: $("settingsBtn"), closeSettings: $("closeSettings"),
   overlay: $("overlay"), settings: $("settings"), saveSettings: $("saveSettings"),
   apiKey: $("apiKey"), model: $("model"), groundingToggle: $("groundingToggle"), hiresToggle: $("hiresToggle"),
+  deepToggle: $("deepToggle"), visionKey: $("visionKey"),
   tabPhoto: $("tab-photo"), tabLookup: $("tab-lookup"),
   modePhoto: $("mode-photo"), modeLookup: $("mode-lookup"),
   dropzone: $("dropzone"), fileInput: $("fileInput"), dzEmpty: $("dzEmpty"), dzPreview: $("dzPreview"),
@@ -258,6 +263,7 @@ Return ONLY strict JSON (no markdown, no prose outside JSON):
   "country": "country name",
   "country_code": "ISO 3166-1 alpha-2, UPPERCASE (e.g. JP, BR, US)",
   "address_query": "the MOST specific geocodable string the evidence supports, ordered specific→general, e.g. 'Gare de Lyon, Paris, France' or 'Avenida Paulista 1500, São Paulo, Brazil' or 'Shibuya Crossing, Tokyo, Japan'. Build it from text/landmarks you actually read. Omit parts you cannot justify; if you only know the country, just give the country.",
+  "candidates": ["up to 4 DISTINCT geocodable strings, ranked best-first — alternative specific guesses for where this is (e.g. a business name + city, a street + city, a landmark + city). These get geocoded and cross-checked, so favour specific, real, named places over vague areas."],
   "best_guess": {
     "place": "human-readable, as specific as the evidence allows",
     "latitude": number,
@@ -276,12 +282,21 @@ Return ONLY strict JSON (no markdown, no prose outside JSON):
 }
 Be confident but honest: if clues are thin, lower the confidence and widen precision/radius. NEVER invent text you cannot actually read, and never fabricate coordinates you can't justify.`;
 
-async function callGemini(image) {
+function webHintsBlock(web) {
+  if (!web) return "";
+  let s = "\n\nREVERSE-IMAGE-SEARCH HINTS (strong leads from running this exact photo through Google Vision — treat as evidence, but VERIFY against the actual pixels, they can be wrong):";
+  if (web.bestGuess) s += `\n- Best-guess label: ${web.bestGuess}`;
+  if (web.entities?.length) s += `\n- Web entities: ${web.entities.slice(0, 8).join(", ")}`;
+  if (web.landmarks?.length) s += `\n- Landmark match: ${web.landmarks.map((l) => `${l.name} (${l.lat.toFixed(4)}, ${l.lng.toFixed(4)})`).join("; ")}`;
+  return s;
+}
+
+async function callGemini(image, web) {
   const key = store.key.trim();
   if (!key) throw new Error("No API key. Open settings (⚙) and add your Gemini API key.");
 
   const body = {
-    contents: [{ role: "user", parts: [{ text: GEO_PROMPT }, { inlineData: image }] }],
+    contents: [{ role: "user", parts: [{ text: GEO_PROMPT + webHintsBlock(web) }, { inlineData: image }] }],
     generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
   };
   if (store.grounding) body.tools = [{ google_search: {} }];
@@ -333,40 +348,84 @@ function radiusToPrecision(m) {
   if (m < 150000) return "region";
   return "country";
 }
-// Geocode the model's address_query; if it resolves near the model's coarse
-// guess, snap to those (precise) coordinates and derive a tight radius.
-async function refineWithGeocode(g) {
-  const q = (g.address_query || "").trim();
-  if (q.length < 3) return null;
-  let arr;
-  try {
-    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=0&accept-language=en&q=${encodeURIComponent(q)}`, { headers: { "Accept": "application/json" } });
-    arr = await r.json();
-  } catch { return null; }
-  if (!Array.isArray(arr) || !arr.length) return null;
-  const hit = arr[0];
-  const lat = parseFloat(hit.lat), lng = parseFloat(hit.lon);
-  if (!isFinite(lat) || !isFinite(lng)) return null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // radius from the match's bounding box (a building → tiny, a city → big)
-  let radius = 8000;
-  const bb = hit.boundingbox?.map(Number);
-  if (bb && bb.length === 4 && bb.every(isFinite)) {
-    radius = Math.max(60, Math.min(300000, haversine(bb[0], bb[2], bb[1], bb[3]) / 2));
+/* ---- reverse image search via Google Vision (optional, needs a Vision key) ---- */
+async function visionDetect(image) {
+  const key = store.visionKey.trim();
+  if (!key) return null;
+  const body = { requests: [{ image: { content: image.data }, features: [
+    { type: "LANDMARK_DETECTION", maxResults: 5 }, { type: "WEB_DETECTION", maxResults: 10 },
+  ] }] };
+  const r = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(key)}`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) {
+    let d = ""; try { d = (await r.json())?.error?.message || ""; } catch {}
+    throw new Error("Vision API: " + (d || `HTTP ${r.status}`));
   }
+  const resp = (await r.json())?.responses?.[0] || {};
+  const landmarks = (resp.landmarkAnnotations || [])
+    .map((l) => ({ name: l.description, score: l.score, lat: l.locations?.[0]?.latLng?.latitude, lng: l.locations?.[0]?.latLng?.longitude }))
+    .filter((l) => isFinite(l.lat) && isFinite(l.lng));
+  const wd = resp.webDetection || {};
+  const entities = (wd.webEntities || []).filter((e) => e.description && (e.score || 0) > 0.3).map((e) => e.description);
+  const bestGuess = wd.bestGuessLabels?.[0]?.label || "";
+  return { landmarks, entities, bestGuess };
+}
 
-  // sanity check: don't let an ambiguous name yank the pin to another continent.
-  const mLat = g.best_guess?.latitude, mLng = g.best_guess?.longitude;
-  if (isFinite(mLat) && isFinite(mLng) && haversine(mLat, mLng, lat, lng) > 800000) return null;
+/* ---- geocode a list of candidate place strings → precise coords ---- */
+async function geocodeCandidates(queries) {
+  const seen = new Set(), out = [];
+  for (const q0 of queries) {
+    const q = (q0 || "").trim();
+    if (q.length < 3) continue;
+    const k = q.toLowerCase();
+    if (seen.has(k)) continue; seen.add(k);
+    try {
+      const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=en&q=${encodeURIComponent(q)}`, { headers: { "Accept": "application/json" } });
+      const arr = await r.json();
+      if (Array.isArray(arr) && arr.length) {
+        const h = arr[0], lat = parseFloat(h.lat), lng = parseFloat(h.lon);
+        if (isFinite(lat) && isFinite(lng)) {
+          let radius = 8000; const bb = h.boundingbox?.map(Number);
+          if (bb && bb.length === 4 && bb.every(isFinite)) radius = Math.max(60, Math.min(300000, haversine(bb[0], bb[2], bb[1], bb[3]) / 2));
+          out.push({ query: q, display: h.display_name, lat, lng, radius_m: Math.round(radius), precision: radiusToPrecision(radius) });
+        }
+      }
+    } catch { /* skip */ }
+    if (out.length >= 5) break;
+    await sleep(1100); // Nominatim asks for ≤1 req/sec
+  }
+  return out;
+}
 
-  return { lat, lng, radius_m: Math.round(radius), precision: radiusToPrecision(radius), display: hit.display_name };
+/* ---- pass 2: show the image + geocoded candidates and let the model pick ---- */
+async function verifyCandidates(image, cands, g) {
+  const key = store.key.trim();
+  if (!key) return null;
+  const list = cands.map((c, i) => `${i}. ${c.display} [${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}]`).join("\n");
+  const prompt = `You are verifying the location of this photo. You earlier read: ${JSON.stringify(g.readable_text || [])} and noted: ${(g.meta_clues || []).map((m) => m.detail).join(" | ")}.
+Here are geocoded candidate locations (number. resolved address [lat, lng]):
+${list}
+
+Look again at the IMAGE and choose the SINGLE candidate whose real-world location is most consistent with every visible clue. Return ONLY JSON: {"index": <candidate number, or -1 if none truly fit>, "confidence": 0-100, "place": "final human-readable place", "note": "one short sentence on why"}.`;
+  const body = { contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: image }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 600 } };
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${store.model}:generateContent?key=${encodeURIComponent(key)}`;
+  let r; try { r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); } catch { return null; }
+  if (!r.ok) return null;
+  const t = (await r.json())?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
+  let c = t.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  const s = c.indexOf("{"), e = c.lastIndexOf("}");
+  if (s !== -1 && e !== -1) c = c.slice(s, e + 1);
+  try { return JSON.parse(c); } catch { return null; }
 }
 
 const HYPE_LINES = [
-  "Scanning the horizon…", "Reading the road lines…", "Checking the bollards…",
-  "Inspecting the license plates…", "Identifying the script…", "Reading every sign…",
-  "Clocking the architecture…", "Reading sun &amp; shadows…", "Cross-referencing landmarks…",
-  "Triangulating the spot…", "Narrowing it down…", "Calling it…",
+  "Scanning the horizon…", "Reverse image searching…", "Reading the road lines…",
+  "Checking the bollards…", "Inspecting the license plates…", "Identifying the script…",
+  "Reading every sign…", "Clocking the architecture…", "Cross-checking the map…",
+  "Geocoding the candidates…", "Verifying the match…", "Triangulating the spot…",
+  "Narrowing it down…", "Calling it…",
 ];
 function startHype(el) {
   let i = 0; if (el) el.innerHTML = HYPE_LINES[0];
@@ -411,17 +470,47 @@ els.analyzeBtn.addEventListener("click", async () => {
   let guessCard = "", aiBest = null, alts = [];
   try {
     const image = await fileToAIImage(currentFile, store.hires ? 3072 : 1280);
-    const g = await callGemini(image);
 
-    // Accuracy booster: geocode the model's named place for precise coordinates.
-    const ref = await refineWithGeocode(g).catch(() => null);
-    if (ref) {
+    // Stage A — reverse image search (optional; only if a Vision key is set).
+    let web = null;
+    const meta = { steps: [] };
+    if (store.visionKey.trim()) {
+      try { web = await visionDetect(image); if (web) meta.web = web; }
+      catch (err) { meta.webError = err.message; }
+    }
+
+    // Stage 1 — Gemini vision read → clues + candidate place names.
+    const g = await callGemini(image, web);
+
+    // Stage 2 — geocode every candidate string (model's + vision's) on the map.
+    const queries = [];
+    if (g.address_query) queries.push(g.address_query);
+    (g.candidates || []).forEach((c) => queries.push(c));
+    if (web?.bestGuess) queries.push(web.bestGuess);
+    (web?.entities || []).slice(0, 3).forEach((e) => queries.push(e));
+    if (g.best_guess?.place) queries.push(g.best_guess.place);
+    const geo = await geocodeCandidates(queries);
+    // Vision landmarks come with coordinates already — add them as top candidates.
+    (web?.landmarks || []).forEach((l) => geo.unshift({ query: l.name, display: l.name + " (Vision landmark)", lat: l.lat, lng: l.lng, radius_m: 200, precision: "exact-building", vision: true }));
+
+    // Keep only candidates near the model's coarse read (guards against bad geocodes).
+    const mLat = g.best_guess?.latitude, mLng = g.best_guess?.longitude;
+    const near = (isFinite(mLat) && isFinite(mLng)) ? geo.filter((c) => haversine(mLat, mLng, c.lat, c.lng) <= 800000) : geo;
+    const pool = near.length ? near : geo;
+    meta.candidateCount = pool.length;
+
+    // Stage 3 — verify: let the model pick the best candidate against the image.
+    let chosen = null;
+    if (store.deep && pool.length >= 2) {
+      const v = await verifyCandidates(image, pool, g).catch(() => null);
+      if (v && v.index >= 0 && pool[v.index]) { chosen = pool[v.index]; meta.verifyNote = v.note || ""; if (v.place) chosen.label = v.place; if (isFinite(v.confidence)) meta.verifyConf = v.confidence; }
+    }
+    if (!chosen && pool.length) chosen = pool.slice().sort((a, b) => a.radius_m - b.radius_m)[0]; // most specific
+    if (chosen) {
       g.best_guess = g.best_guess || {};
-      g.best_guess.latitude = ref.lat;
-      g.best_guess.longitude = ref.lng;
-      g.best_guess.radius_m = ref.radius_m;
-      g.best_guess.precision = ref.precision;
-      g.geocode_match = ref.display;
+      g.best_guess.latitude = chosen.lat; g.best_guess.longitude = chosen.lng;
+      g.best_guess.radius_m = chosen.radius_m; g.best_guess.precision = chosen.precision;
+      g.geocode_match = chosen.label || chosen.display;
     }
 
     const bg = g.best_guess || {};
@@ -429,9 +518,13 @@ els.analyzeBtn.addEventListener("click", async () => {
       aiBest = { lat: bg.latitude, lng: bg.longitude, color: "#ffb648", radius_m: bg.radius_m || 0, precision: bg.precision,
         popup: `<b>${esc(g.country || "AI guess")} ${countryFlag(g.country_code)}</b><br>${esc(bg.place || "")}<br>${fmt(bg.latitude)}, ${fmt(bg.longitude)}` };
     }
-    alts = (g.alternatives || []).filter((a) => isFinite(a.latitude) && isFinite(a.longitude))
-      .map((a) => ({ lat: a.latitude, lng: a.longitude, popup: `<b>Alt:</b> ${esc(a.place || "")}` }));
-    guessCard = renderGuess(g);
+    // Other geocoded candidates become blue cross-check pins.
+    alts = pool.filter((c) => c !== chosen).slice(0, 4)
+      .map((c) => ({ lat: c.lat, lng: c.lng, popup: `<b>Candidate:</b> ${esc(c.display)}` }));
+    (g.alternatives || []).filter((a) => isFinite(a.latitude) && isFinite(a.longitude))
+      .forEach((a) => alts.push({ lat: a.latitude, lng: a.longitude, popup: `<b>Alt:</b> ${esc(a.place || "")}` }));
+
+    guessCard = renderGuess(g, meta);
   } catch (err) {
     guessCard = `<div class="card error-card">AI analysis failed: ${esc(err.message)}</div>`;
   }
@@ -464,7 +557,24 @@ function metaClues(arr) {
     arr.map((c) => `<div class="meta-row"><span class="meta-ico">${META_ICON[c.category] || "🔎"}</span>
       <span class="meta-cat">${esc(c.category || "")}</span><span class="meta-det">${esc(c.detail || "")}</span></div>`).join("") + `</div>`;
 }
-function renderGuess(g) {
+function pipelineBlock(meta) {
+  if (!meta) return "";
+  const rows = [];
+  if (meta.web) {
+    const bits = [];
+    if (meta.web.bestGuess) bits.push(`“${esc(meta.web.bestGuess)}”`);
+    if (meta.web.landmarks?.length) bits.push(`${meta.web.landmarks.length} landmark match${meta.web.landmarks.length > 1 ? "es" : ""}`);
+    rows.push(`<div class="pipe-row"><span>🔁 Reverse image search</span><span>${bits.join(" · ") || "no strong match"}</span></div>`);
+  } else if (meta.webError) {
+    rows.push(`<div class="pipe-row warn"><span>🔁 Reverse image search</span><span>${esc(meta.webError)}</span></div>`);
+  }
+  if (meta.candidateCount != null)
+    rows.push(`<div class="pipe-row"><span>🗺️ Map cross-check</span><span>${meta.candidateCount} candidate${meta.candidateCount === 1 ? "" : "s"} geocoded</span></div>`);
+  if (meta.verifyNote)
+    rows.push(`<div class="pipe-row"><span>✅ AI verify${meta.verifyConf != null ? ` · ${clamp(meta.verifyConf)}%` : ""}</span><span>${esc(meta.verifyNote)}</span></div>`);
+  return rows.length ? `<div class="section-title">🔬 How it was pinned</div><div class="pipeline">${rows.join("")}</div>` : "";
+}
+function renderGuess(g, meta) {
   const bg = g.best_guess || {};
   const conf = clamp(bg.confidence);
   const hasCoords = isFinite(bg.latitude) && isFinite(bg.longitude);
@@ -484,6 +594,7 @@ function renderGuess(g) {
       ${hasCoords ? `<div class="coords"><a href="${mapsLink(bg.latitude, bg.longitude)}" target="_blank" rel="noopener">${fmt(bg.latitude)}, ${fmt(bg.longitude)} ↗</a>${bg.radius_m ? ` · ±${fmtDist(bg.radius_m)}` : ""}</div>` : ""}
       ${g.geocode_match ? `<p class="refined">🎯 Snapped to <b>${esc(g.geocode_match)}</b> via geocoding</p>` : ""}
       <div class="conf-track big"><div class="conf-fill" style="width:${conf}%"></div></div>
+      ${pipelineBlock(meta)}
       ${metaClues(g.meta_clues)}
       ${g.reasoning ? `<div class="section-title">🧠 The read</div><p class="reasoning">${esc(g.reasoning)}</p>` : ""}
       ${list("📝 Text spotted", g.readable_text, "text-chip")}
@@ -594,6 +705,7 @@ els.myIpBtn.addEventListener("click", () => runLookup("", true));
 function openSettings() {
   els.apiKey.value = store.key; els.model.value = store.model;
   els.groundingToggle.checked = store.grounding; els.hiresToggle.checked = store.hires;
+  els.deepToggle.checked = store.deep; els.visionKey.value = store.visionKey;
   els.settings.hidden = false; els.overlay.hidden = false;
 }
 function closeSettings() { els.settings.hidden = true; els.overlay.hidden = true; }
@@ -603,6 +715,7 @@ els.overlay.addEventListener("click", closeSettings);
 els.saveSettings.addEventListener("click", () => {
   store.key = els.apiKey.value.trim(); store.model = els.model.value;
   store.grounding = els.groundingToggle.checked; store.hires = els.hiresToggle.checked;
+  store.deep = els.deepToggle.checked; store.visionKey = els.visionKey.value.trim();
   closeSettings();
   setStatus(store.key ? "online" : "", store.key ? "Ready" : "No key");
 });
