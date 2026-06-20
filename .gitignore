@@ -1,0 +1,7 @@
+# Nothing secret lives in the repo — the API key stays in the browser.
+.DS_Store
+Thumbs.db
+*.log
+node_modules/
+.vscode/
+.idea/
