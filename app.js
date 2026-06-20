@@ -140,7 +140,9 @@ function revealLocation(primary, alternates, badge) {
   setTimeout(() => {
     map.flyTo([primary.lat, primary.lng], zoom, { duration: 2.4, easeLinearity: 0.25 });
     map.once("moveend", place);
-    setTimeout(place, 2900); // fallback if the fly animation never completes
+    // Fallback: if the fly animation never completes (throttled rAF / background
+    // tab), snap to the target and drop the pin anyway.
+    setTimeout(() => { if (!placed) { map.setView([primary.lat, primary.lng], zoom, { animate: false }); place(); } }, 2900);
   }, 350);
   setTimeout(() => map.invalidateSize(), 100);
 }
@@ -248,11 +250,14 @@ Spot the "metas" like a pro:
 
 Then triangulate to the most specific location the evidence supports.
 
+CRITICAL FOR ACCURACY: your recalled latitude/longitude will be imprecise (you remember places, not exact coordinates). So put your real effort into "address_query" — the most specific geocodable string you can build from what you ACTUALLY see (a street name, a named business/shop you read off a sign, a landmark, a transit stop), qualified with city and country. A geocoder will convert that string into exact coordinates, so a precise NAME beats a precise-looking number. If you can read a street or business name, you can often nail it to within a block.
+
 Return ONLY strict JSON (no markdown, no prose outside JSON):
 {
   "verdict": "ONE punchy, confident sentence naming the place and the killer clue — in the voice of a cocky world-class GeoGuessr pro (e.g. \\"Yeah that's southern Brazil — the yellow centre lines and the .br plate sealed it.\\")",
   "country": "country name",
   "country_code": "ISO 3166-1 alpha-2, UPPERCASE (e.g. JP, BR, US)",
+  "address_query": "the MOST specific geocodable string the evidence supports, ordered specific→general, e.g. 'Gare de Lyon, Paris, France' or 'Avenida Paulista 1500, São Paulo, Brazil' or 'Shibuya Crossing, Tokyo, Japan'. Build it from text/landmarks you actually read. Omit parts you cannot justify; if you only know the country, just give the country.",
   "best_guess": {
     "place": "human-readable, as specific as the evidence allows",
     "latitude": number,
@@ -277,7 +282,7 @@ async function callGemini(image) {
 
   const body = {
     contents: [{ role: "user", parts: [{ text: GEO_PROMPT }, { inlineData: image }] }],
-    generationConfig: { temperature: 0.25, maxOutputTokens: 2048 },
+    generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
   };
   if (store.grounding) body.tools = [{ google_search: {} }];
 
@@ -307,10 +312,54 @@ async function callGemini(image) {
 
 async function reverseGeocode(lat, lng) {
   try {
-    const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=18`, { headers: { "Accept": "application/json" } });
+    const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=18&accept-language=en`, { headers: { "Accept": "application/json" } });
     const j = await r.json();
     return j?.display_name || null;
   } catch { return null; }
+}
+
+/* ---- accuracy booster: turn the model's named place into precise coords ---- */
+function haversine(aLat, aLng, bLat, bLng) {
+  const R = 6371000, toR = Math.PI / 180;
+  const dLat = (bLat - aLat) * toR, dLng = (bLng - aLng) * toR;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(aLat * toR) * Math.cos(bLat * toR) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+function radiusToPrecision(m) {
+  if (m < 250) return "exact-building";
+  if (m < 1200) return "street";
+  if (m < 4000) return "neighborhood";
+  if (m < 25000) return "city";
+  if (m < 150000) return "region";
+  return "country";
+}
+// Geocode the model's address_query; if it resolves near the model's coarse
+// guess, snap to those (precise) coordinates and derive a tight radius.
+async function refineWithGeocode(g) {
+  const q = (g.address_query || "").trim();
+  if (q.length < 3) return null;
+  let arr;
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=0&accept-language=en&q=${encodeURIComponent(q)}`, { headers: { "Accept": "application/json" } });
+    arr = await r.json();
+  } catch { return null; }
+  if (!Array.isArray(arr) || !arr.length) return null;
+  const hit = arr[0];
+  const lat = parseFloat(hit.lat), lng = parseFloat(hit.lon);
+  if (!isFinite(lat) || !isFinite(lng)) return null;
+
+  // radius from the match's bounding box (a building → tiny, a city → big)
+  let radius = 8000;
+  const bb = hit.boundingbox?.map(Number);
+  if (bb && bb.length === 4 && bb.every(isFinite)) {
+    radius = Math.max(60, Math.min(300000, haversine(bb[0], bb[2], bb[1], bb[3]) / 2));
+  }
+
+  // sanity check: don't let an ambiguous name yank the pin to another continent.
+  const mLat = g.best_guess?.latitude, mLng = g.best_guess?.longitude;
+  if (isFinite(mLat) && isFinite(mLng) && haversine(mLat, mLng, lat, lng) > 800000) return null;
+
+  return { lat, lng, radius_m: Math.round(radius), precision: radiusToPrecision(radius), display: hit.display_name };
 }
 
 const HYPE_LINES = [
@@ -361,8 +410,20 @@ els.analyzeBtn.addEventListener("click", async () => {
 
   let guessCard = "", aiBest = null, alts = [];
   try {
-    const image = await fileToAIImage(currentFile, store.hires ? 2048 : 1024);
+    const image = await fileToAIImage(currentFile, store.hires ? 3072 : 1280);
     const g = await callGemini(image);
+
+    // Accuracy booster: geocode the model's named place for precise coordinates.
+    const ref = await refineWithGeocode(g).catch(() => null);
+    if (ref) {
+      g.best_guess = g.best_guess || {};
+      g.best_guess.latitude = ref.lat;
+      g.best_guess.longitude = ref.lng;
+      g.best_guess.radius_m = ref.radius_m;
+      g.best_guess.precision = ref.precision;
+      g.geocode_match = ref.display;
+    }
+
     const bg = g.best_guess || {};
     if (isFinite(bg.latitude) && isFinite(bg.longitude)) {
       aiBest = { lat: bg.latitude, lng: bg.longitude, color: "#ffb648", radius_m: bg.radius_m || 0, precision: bg.precision,
@@ -421,6 +482,7 @@ function renderGuess(g) {
       ${g.verdict ? `<p class="verdict">“${esc(g.verdict)}”</p>` : ""}
       ${bg.place ? `<p class="place-name small">${esc(bg.place)}</p>` : ""}
       ${hasCoords ? `<div class="coords"><a href="${mapsLink(bg.latitude, bg.longitude)}" target="_blank" rel="noopener">${fmt(bg.latitude)}, ${fmt(bg.longitude)} ↗</a>${bg.radius_m ? ` · ±${fmtDist(bg.radius_m)}` : ""}</div>` : ""}
+      ${g.geocode_match ? `<p class="refined">🎯 Snapped to <b>${esc(g.geocode_match)}</b> via geocoding</p>` : ""}
       <div class="conf-track big"><div class="conf-fill" style="width:${conf}%"></div></div>
       ${metaClues(g.meta_clues)}
       ${g.reasoning ? `<div class="section-title">🧠 The read</div><p class="reasoning">${esc(g.reasoning)}</p>` : ""}

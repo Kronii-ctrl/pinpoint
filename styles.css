@@ -275,6 +275,8 @@ input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--green); 
 .rc-lbl { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--text-dim); margin-top: 2px; }
 
 .verdict { font-size: 16px; font-style: italic; line-height: 1.5; color: var(--green-soft); margin: 14px 0 6px; border-left: 3px solid var(--green-dim); padding-left: 12px; }
+.refined { font-size: 12.5px; line-height: 1.45; color: var(--green); margin: 8px 0 0; padding: 7px 10px; border: 1px solid var(--green-dim); border-radius: 8px; background: rgba(94, 243, 140, .07); }
+.refined b { color: var(--green-soft); font-weight: 600; }
 .place-name.small { font-size: 15px; color: var(--text-dim); margin: 4px 0 2px; }
 .conf-track.big { height: 10px; margin-top: 10px; }
 
