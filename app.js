@@ -43,14 +43,22 @@ function setStatus(state, text) {
 }
 
 /* ---------- Leaflet map ---------- */
-let map, markerLayer;
+let map, markerLayer, darkLayer, satLayer;
 function initMap() {
   map = L.map("map", { zoomControl: true, attributionControl: true }).setView([20, 0], 2);
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  darkLayer = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
     attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 20, subdomains: "abcd",
   }).addTo(map);
+  satLayer = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+    attribution: "&copy; Esri", maxZoom: 19,
+  });
+  L.control.layers({ "🌑 Dark": darkLayer, "🛰️ Satellite": satLayer }, null, { position: "topright" }).addTo(map);
   markerLayer = L.layerGroup().addTo(map);
   setTimeout(() => map.invalidateSize(), 200);
+}
+function useSatellite(on) {
+  if (on && !map.hasLayer(satLayer)) { map.removeLayer(darkLayer); satLayer.addTo(map); }
+  if (!on && !map.hasLayer(darkLayer)) { map.removeLayer(satLayer); darkLayer.addTo(map); }
 }
 
 function colorIcon(color) {
@@ -60,6 +68,17 @@ function colorIcon(color) {
            border:3px solid #05080c;box-shadow:0 0 0 2px ${color},0 0 12px ${color};"></div>`,
   });
 }
+// A big dropping pin for the dramatic photo reveal.
+function dropPin(color) {
+  return L.divIcon({
+    className: "", iconSize: [34, 46], iconAnchor: [17, 44], popupAnchor: [0, -42],
+    html: `<div class="drop-pin" style="--pin:${color}">
+             <svg viewBox="0 0 34 46" width="34" height="46"><path d="M17 1C8.7 1 2 7.7 2 16c0 10.5 15 29 15 29s15-18.5 15-29C32 7.7 25.3 1 17 1z"
+               fill="${color}" stroke="#05080c" stroke-width="2"/><circle cx="17" cy="16" r="6" fill="#05080c"/></svg>
+           </div>`,
+  });
+}
+const PRECISION_ZOOM = { "exact-building": 18, street: 17, neighborhood: 15, city: 12, region: 8, country: 5, continent: 3, unknown: 4 };
 
 /* points: [{lat,lng,color,label,popup,radius_m}] */
 function plot(points, badge) {
@@ -86,6 +105,43 @@ function plot(points, badge) {
   }
   if (badge) { els.mapBadge.textContent = badge; els.mapBadge.hidden = false; }
   else els.mapBadge.hidden = true;
+  setTimeout(() => map.invalidateSize(), 100);
+}
+
+/* Rainbolt-style reveal: spin the globe, fly to the spot, drop the pin. */
+function revealLocation(primary, alternates, badge) {
+  markerLayer.clearLayers();
+  if (!primary || !isFinite(primary.lat) || !isFinite(primary.lng)) return;
+  els.mapBadge.hidden = true;
+  useSatellite(true);
+  // start from a wide world view for the "zoom from space" effect
+  map.setView([primary.lat, Math.max(-160, Math.min(160, primary.lng))], 2, { animate: false });
+  const zoom = PRECISION_ZOOM[primary.precision] || 12;
+
+  // Drop the pin once we arrive — but never depend solely on the animation
+  // firing (background tabs / throttled rAF can stall flyTo), so guard with a
+  // fallback timer that lands the pin regardless.
+  let placed = false;
+  const place = () => {
+    if (placed) return; placed = true;
+    const m = L.marker([primary.lat, primary.lng], { icon: dropPin(primary.color), zIndexOffset: 1000 })
+      .addTo(markerLayer).bindPopup(primary.popup || "");
+    setTimeout(() => m.openPopup(), 450);
+    if (primary.radius_m > 0) L.circle([primary.lat, primary.lng], {
+      radius: primary.radius_m, color: primary.color, weight: 1, opacity: .6, fillColor: primary.color, fillOpacity: .12,
+    }).addTo(markerLayer);
+    (alternates || []).forEach((a) => {
+      if (isFinite(a.lat) && isFinite(a.lng))
+        L.marker([a.lat, a.lng], { icon: colorIcon("#57b6ff") }).addTo(markerLayer).bindPopup(a.popup || "");
+    });
+    if (badge) { els.mapBadge.textContent = badge; els.mapBadge.hidden = false; }
+  };
+
+  setTimeout(() => {
+    map.flyTo([primary.lat, primary.lng], zoom, { duration: 2.4, easeLinearity: 0.25 });
+    map.once("moveend", place);
+    setTimeout(place, 2900); // fallback if the fly animation never completes
+  }, 350);
   setTimeout(() => map.invalidateSize(), 100);
 }
 
@@ -138,6 +194,7 @@ els.clearBtn.addEventListener("click", () => {
   els.dzPreview.hidden = true; els.dzEmpty.hidden = false; els.fileInput.value = "";
   els.analyzeBtn.disabled = true; els.clearBtn.disabled = true;
   els.photoResults.innerHTML = `<p class="placeholder">Photos with GPS metadata resolve to <b>exact</b> coordinates. Otherwise the AI reads signs, architecture, plates &amp; terrain to make its best guess.</p>`;
+  useSatellite(false);
   plot([]);
 });
 
@@ -178,19 +235,24 @@ function fileToAIImage(file, maxDim) {
   });
 }
 
-const GEO_PROMPT = `You are an elite geolocation analyst — a world-champion GeoGuessr player combined with an OSINT investigator. Determine, as PRECISELY as possible, where this photograph was taken.
+const GEO_PROMPT = `You are a world-champion GeoGuessr player and OSINT investigator — think Rainbolt. Pinpoint where this photo was taken, fast and confident, but back every call with evidence.
 
-Work methodically:
-1. TRANSCRIBE every piece of readable text: shop/business names, street & road signs, license plates, phone numbers, posters, brand logos. Read even partially-visible text. Text is the single highest-value clue.
-2. Identify the script/language and region-specific spellings or area codes.
-3. Note driving side, road markings, bollards, traffic-signal style, utility poles, license-plate format & colours.
-4. Note architecture, building materials, roofing, signage style, urban vs rural layout.
-5. Note vegetation, terrain, geology, climate cues, sun position & shadow direction.
-6. Identify any recognizable landmark, mountain silhouette, coastline, or skyline.
-7. Triangulate to the most specific location the evidence supports.
+Spot the "metas" like a pro:
+1. TRANSCRIBE all readable text: shop/business names, street & road signs, license plates, phone area codes, posters, brand logos, graffiti. Even partial text is gold.
+2. Script & language, region-specific spellings, domain suffixes (.br, .ng…), phone formats.
+3. Driving side, road-line colour & pattern, bollards, chevrons, traffic-signal & sign design.
+4. Utility/power poles, guardrails, license-plate shape & colour.
+5. Architecture, building materials, roofing, urban vs rural layout.
+6. Vegetation, soil/terrain colour, climate cues, sun position & shadow direction (hemisphere).
+7. Landmarks, mountain silhouettes, coastlines, skylines.
+
+Then triangulate to the most specific location the evidence supports.
 
 Return ONLY strict JSON (no markdown, no prose outside JSON):
 {
+  "verdict": "ONE punchy, confident sentence naming the place and the killer clue — in the voice of a cocky world-class GeoGuessr pro (e.g. \\"Yeah that's southern Brazil — the yellow centre lines and the .br plate sealed it.\\")",
+  "country": "country name",
+  "country_code": "ISO 3166-1 alpha-2, UPPERCASE (e.g. JP, BR, US)",
   "best_guess": {
     "place": "human-readable, as specific as the evidence allows",
     "latitude": number,
@@ -199,12 +261,15 @@ Return ONLY strict JSON (no markdown, no prose outside JSON):
     "confidence": integer 0-100,
     "radius_m": integer (estimated error radius in metres)
   },
-  "reasoning": "2-4 sentences on how you reached it",
+  "reasoning": "2-4 sentences walking through the deduction",
   "readable_text": ["each distinct piece of text you could actually read"],
-  "clues": ["the specific visual clues you used"],
+  "meta_clues": [
+    { "category": "Language" | "Road" | "Plates" | "Bollards" | "Poles" | "Architecture" | "Vegetation" | "Climate" | "Landmark" | "Other",
+      "detail": "what you see AND what it tells you" }
+  ],
   "alternatives": [ { "place": "...", "latitude": number, "longitude": number, "confidence": integer } ]
 }
-Be honest: if there are few geographic clues, give low confidence and coarse precision. NEVER invent text you cannot actually read, and never fabricate coordinates you can't justify.`;
+Be confident but honest: if clues are thin, lower the confidence and widen precision/radius. NEVER invent text you cannot actually read, and never fabricate coordinates you can't justify.`;
 
 async function callGemini(image) {
   const key = store.key.trim();
@@ -248,24 +313,34 @@ async function reverseGeocode(lat, lng) {
   } catch { return null; }
 }
 
+const HYPE_LINES = [
+  "Scanning the horizon…", "Reading the road lines…", "Checking the bollards…",
+  "Inspecting the license plates…", "Identifying the script…", "Reading every sign…",
+  "Clocking the architecture…", "Reading sun &amp; shadows…", "Cross-referencing landmarks…",
+  "Triangulating the spot…", "Narrowing it down…", "Calling it…",
+];
+function startHype(el) {
+  let i = 0; if (el) el.innerHTML = HYPE_LINES[0];
+  const t = setInterval(() => { i = (i + 1) % HYPE_LINES.length; if (el) el.innerHTML = HYPE_LINES[i]; }, 1050);
+  return () => clearInterval(t);
+}
+
 let analyzing = false;
 els.analyzeBtn.addEventListener("click", async () => {
   if (!currentFile || analyzing) return;
   analyzing = true;
   els.analyzeBtn.disabled = true;
   setStatus("busy", "Analyzing");
+
+  // 1) EXACT path — GPS embedded in the photo (the truth, if present).
   els.photoResults.innerHTML = `<div class="card"><span class="spinner"></span>Reading metadata…</div>`;
-
-  const points = [];
-  let html = "";
-
-  // 1) EXACT path — GPS embedded in the photo.
   const exif = await readExif(currentFile);
+  let exactPoint = null, exactCard = "";
   if (exif && exif.lat != null && exif.lng != null) {
     const addr = await reverseGeocode(exif.lat, exif.lng);
-    points.push({ lat: exif.lat, lng: exif.lng, color: "#5ef38c", radius_m: 12,
-      popup: `<b>Exact — photo GPS</b><br>${esc(addr || "")}<br>${fmt(exif.lat)}, ${fmt(exif.lng)}` });
-    html += `
+    exactPoint = { lat: exif.lat, lng: exif.lng, color: "#5ef38c", radius_m: 12, precision: "exact-building",
+      popup: `<b>📍 Exact — photo GPS</b><br>${esc(addr || "")}<br>${fmt(exif.lat)}, ${fmt(exif.lng)}` };
+    exactCard = `
       <div class="card exact">
         <span class="card-tag tag-exact">● Exact · photo GPS metadata</span>
         <p class="place-name">${esc(addr || "Embedded GPS coordinates")}</p>
@@ -276,56 +351,80 @@ els.analyzeBtn.addEventListener("click", async () => {
           ${exif.taken ? `<dt>Taken</dt><dd>${esc(formatDate(exif.taken))}</dd>` : ""}
           ${exif.camera ? `<dt>Camera</dt><dd>${esc(exif.camera)}</dd>` : ""}
         </dl>
-        <p class="note">This is the location the camera actually recorded — accurate to a few metres.</p>
+        <p class="note">The location the camera actually recorded — accurate to a few metres. Green pin on the map.</p>
       </div>`;
-  } else {
-    html += `<div class="card"><p class="note">No GPS metadata in this photo (common for screenshots & social-media images). Falling back to AI visual analysis…</p></div>`;
   }
 
-  // 2) AI visual best-guess (always run — useful even when GPS exists, as a cross-check).
-  els.photoResults.innerHTML = html + `<div class="card"><span class="spinner"></span>AI is reading the scene${store.grounding ? " &amp; verifying landmarks online" : ""}… (pro can take ~15–30s)</div>`;
+  // 2) AI visual read — always run (it's the Rainbolt part; also a cross-check when GPS exists).
+  els.photoResults.innerHTML = `<div class="card hype"><span class="spinner"></span><span id="hypeLine">Scanning the horizon…</span></div>` + exactCard;
+  const stopHype = startHype($("hypeLine"));
+
+  let guessCard = "", aiBest = null, alts = [];
   try {
     const image = await fileToAIImage(currentFile, store.hires ? 2048 : 1024);
     const g = await callGemini(image);
     const bg = g.best_guess || {};
     if (isFinite(bg.latitude) && isFinite(bg.longitude)) {
-      points.push({ lat: bg.latitude, lng: bg.longitude, color: "#ffb648", radius_m: bg.radius_m || 0,
-        popup: `<b>AI guess</b><br>${esc(bg.place || "")}<br>${fmt(bg.latitude)}, ${fmt(bg.longitude)}` });
+      aiBest = { lat: bg.latitude, lng: bg.longitude, color: "#ffb648", radius_m: bg.radius_m || 0, precision: bg.precision,
+        popup: `<b>${esc(g.country || "AI guess")} ${countryFlag(g.country_code)}</b><br>${esc(bg.place || "")}<br>${fmt(bg.latitude)}, ${fmt(bg.longitude)}` };
     }
-    (g.alternatives || []).forEach((a) => {
-      if (isFinite(a.latitude) && isFinite(a.longitude))
-        points.push({ lat: a.latitude, lng: a.longitude, color: "#57b6ff", popup: `<b>Alt:</b> ${esc(a.place || "")}` });
-    });
-    html += renderGuess(g);
+    alts = (g.alternatives || []).filter((a) => isFinite(a.latitude) && isFinite(a.longitude))
+      .map((a) => ({ lat: a.latitude, lng: a.longitude, popup: `<b>Alt:</b> ${esc(a.place || "")}` }));
+    guessCard = renderGuess(g);
   } catch (err) {
-    html += `<div class="card error-card">AI analysis failed: ${esc(err.message)}</div>`;
+    guessCard = `<div class="card error-card">AI analysis failed: ${esc(err.message)}</div>`;
   }
+  stopHype();
 
-  els.photoResults.innerHTML = html;
-  wireAltClicks(points);
-  const badge = points.length ? (points[0].color === "#5ef38c" ? "📍 Exact GPS from metadata" : "🤖 AI best-guess — verify before trusting") : null;
-  plot(points, badge);
+  els.photoResults.innerHTML = guessCard + exactCard;
+  wireAltClicks(alts);
+
+  // Reveal: fly to the exact spot if we have it, otherwise the AI's call.
+  const primary = exactPoint || aiBest;
+  if (primary) {
+    const badge = exactPoint ? "📍 Exact GPS from metadata" : "🤖 AI best-guess — verify before trusting";
+    const others = exactPoint && aiBest ? [aiBest, ...alts] : alts;
+    revealLocation(primary, others, badge);
+  }
   setStatus(store.key ? "online" : "", store.key ? "Ready" : "No key");
   els.analyzeBtn.disabled = false;
   analyzing = false;
 });
 
+const META_ICON = { Language: "🔤", Road: "🛣️", Plates: "🚗", Bollards: "🚧", Poles: "⚡", Architecture: "🏛️", Vegetation: "🌿", Climate: "☀️", Landmark: "🗼", Other: "🔎" };
+const clamp = (n) => Math.max(0, Math.min(100, Math.round(n || 0)));
+function countryFlag(cc) {
+  if (!cc || !/^[A-Za-z]{2}$/.test(cc)) return "";
+  return cc.toUpperCase().replace(/./g, (c) => String.fromCodePoint(127397 + c.charCodeAt(0)));
+}
+function metaClues(arr) {
+  if (!Array.isArray(arr) || !arr.length) return "";
+  return `<div class="section-title">🔍 Metas spotted</div><div class="metas">` +
+    arr.map((c) => `<div class="meta-row"><span class="meta-ico">${META_ICON[c.category] || "🔎"}</span>
+      <span class="meta-cat">${esc(c.category || "")}</span><span class="meta-det">${esc(c.detail || "")}</span></div>`).join("") + `</div>`;
+}
 function renderGuess(g) {
   const bg = g.best_guess || {};
-  const conf = Math.max(0, Math.min(100, Math.round(bg.confidence ?? 0)));
+  const conf = clamp(bg.confidence);
   const hasCoords = isFinite(bg.latitude) && isFinite(bg.longitude);
+  const flag = countryFlag(g.country_code);
   return `
-    <div class="card guess">
-      <span class="card-tag tag-guess">◎ AI best-guess · visual analysis</span>
-      <p class="place-name">${esc(bg.place || "Undetermined")}</p>
-      ${hasCoords ? `<div class="coords"><a href="${mapsLink(bg.latitude, bg.longitude)}" target="_blank" rel="noopener">${fmt(bg.latitude)}, ${fmt(bg.longitude)} ↗</a></div>` : ""}
-      <div class="conf">
-        <div class="conf-row"><span>Confidence</span><span>${conf}% · ${esc(bg.precision || "unknown")}${bg.radius_m ? " · ±" + fmtDist(bg.radius_m) : ""}</span></div>
-        <div class="conf-track"><div class="conf-fill" style="width:${conf}%"></div></div>
+    <div class="card reveal">
+      <div class="reveal-head">
+        <div class="flag">${flag || "🌍"}</div>
+        <div class="reveal-co">
+          <div class="reveal-country">${esc(g.country || bg.place || "Unknown")}</div>
+          <div class="reveal-sub">AI best-guess · ${esc((bg.precision || "unknown").toUpperCase())}</div>
+        </div>
+        <div class="reveal-conf"><div class="rc-num">${conf}<span>%</span></div><div class="rc-lbl">certainty</div></div>
       </div>
-      ${g.reasoning ? `<p class="reasoning">${esc(g.reasoning)}</p>` : ""}
-      ${list("Readable text", g.readable_text, "text-chip")}
-      ${list("Clues used", g.clues, "")}
+      ${g.verdict ? `<p class="verdict">“${esc(g.verdict)}”</p>` : ""}
+      ${bg.place ? `<p class="place-name small">${esc(bg.place)}</p>` : ""}
+      ${hasCoords ? `<div class="coords"><a href="${mapsLink(bg.latitude, bg.longitude)}" target="_blank" rel="noopener">${fmt(bg.latitude)}, ${fmt(bg.longitude)} ↗</a>${bg.radius_m ? ` · ±${fmtDist(bg.radius_m)}` : ""}</div>` : ""}
+      <div class="conf-track big"><div class="conf-fill" style="width:${conf}%"></div></div>
+      ${metaClues(g.meta_clues)}
+      ${g.reasoning ? `<div class="section-title">🧠 The read</div><p class="reasoning">${esc(g.reasoning)}</p>` : ""}
+      ${list("📝 Text spotted", g.readable_text, "text-chip")}
       ${alts(g.alternatives)}
     </div>`;
 }
@@ -398,6 +497,7 @@ async function lookupPlace(q) {
 }
 
 async function runLookup(query, forceIp) {
+  useSatellite(false);
   setStatus("busy", "Locating");
   els.lookupResults.innerHTML = `<div class="card"><span class="spinner"></span>Locating…</div>`;
   try {

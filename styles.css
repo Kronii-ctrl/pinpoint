@@ -251,3 +251,54 @@ input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--green); 
 }
 [hidden] { display: none !important; }
 .hidden { display: none !important; }
+
+/* ===== Rainbolt-mode reveal ===== */
+.card.hype { color: var(--green-soft); font-family: "Chakra Petch", sans-serif; letter-spacing: .5px; }
+
+.card.reveal {
+  border-color: rgba(255, 182, 72, .5);
+  background: linear-gradient(180deg, rgba(255, 182, 72, .07), rgba(5, 8, 12, .5));
+  box-shadow: inset 0 0 30px rgba(255, 182, 72, .06);
+  animation: revealPop .45s ease;
+}
+@keyframes revealPop { from { opacity: 0; transform: translateY(10px) scale(.98); } }
+
+.reveal-head { display: flex; align-items: center; gap: 14px; }
+.flag { font-size: 46px; line-height: 1; filter: drop-shadow(0 2px 6px rgba(0,0,0,.5)); animation: flagPop .5s .08s both; }
+@keyframes flagPop { from { transform: scale(.3); opacity: 0; } 70% { transform: scale(1.18); } to { transform: scale(1); opacity: 1; } }
+.reveal-co { flex: 1; min-width: 0; }
+.reveal-country { font-family: "Chakra Petch", sans-serif; font-weight: 700; font-size: 24px; color: var(--text); line-height: 1.1; }
+.reveal-sub { font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--amber); margin-top: 3px; }
+.reveal-conf { text-align: center; flex: none; }
+.rc-num { font-family: "Chakra Petch", sans-serif; font-weight: 700; font-size: 30px; color: var(--green); line-height: 1; text-shadow: var(--glow); }
+.rc-num span { font-size: 14px; color: var(--text-dim); }
+.rc-lbl { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--text-dim); margin-top: 2px; }
+
+.verdict { font-size: 16px; font-style: italic; line-height: 1.5; color: var(--green-soft); margin: 14px 0 6px; border-left: 3px solid var(--green-dim); padding-left: 12px; }
+.place-name.small { font-size: 15px; color: var(--text-dim); margin: 4px 0 2px; }
+.conf-track.big { height: 10px; margin-top: 10px; }
+
+.metas { display: flex; flex-direction: column; gap: 8px; }
+.meta-row {
+  display: grid; grid-template-columns: auto auto 1fr; gap: 6px 11px; align-items: baseline;
+  padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: rgba(94, 243, 140, .04);
+}
+.meta-ico { font-size: 16px; align-self: center; }
+.meta-cat { font-family: "Chakra Petch", sans-serif; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--amber); white-space: nowrap; }
+.meta-det { font-size: 13px; line-height: 1.45; color: var(--text); }
+
+/* Dropping map pin */
+.drop-pin { transform-origin: bottom center; animation: pinDrop .7s cubic-bezier(.2, .85, .3, 1.2) both; filter: drop-shadow(0 6px 7px rgba(0,0,0,.55)); }
+.drop-pin svg { display: block; }
+@keyframes pinDrop {
+  0% { transform: translateY(-260px) scale(.6); opacity: 0; }
+  55% { opacity: 1; }
+  80% { transform: translateY(7px) scale(1.06); }
+  100% { transform: translateY(0) scale(1); }
+}
+
+/* Dark Leaflet layer switcher */
+.leaflet-control-layers { background: var(--panel) !important; color: var(--text) !important; border: 1px solid var(--border) !important; border-radius: 8px !important; box-shadow: 0 4px 16px rgba(0,0,0,.4) !important; }
+.leaflet-control-layers-toggle { background-color: var(--bg-2) !important; }
+.leaflet-control-layers-expanded { padding: 8px 12px !important; }
+.leaflet-control-layers label { font-size: 13px; margin: 3px 0; }
